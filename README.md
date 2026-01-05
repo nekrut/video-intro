@@ -6,13 +6,14 @@ A CLI tool to add a title screen image to the beginning of a video. Perfect for 
 
 - Prepends a static image as an intro to any video
 - Automatically matches the intro to the video's resolution, frame rate, and pixel format
+- **Preserves original audio quality** (no re-encoding of original audio)
 - Handles videos with or without audio tracks
 - Scales and pads images to fit the video dimensions while preserving aspect ratio
 
 ## Requirements
 
 - Python 3.10+
-- FFmpeg (with libx264 support)
+- FFmpeg (with libx264 and AAC support)
 
 ### Installing FFmpeg
 
@@ -74,19 +75,19 @@ video-intro --image ~/designs/logo.png --video ~/recordings/demo.mp4 --duration 
 
 ## How It Works
 
-1. Analyzes the input video to extract resolution, frame rate, and pixel format
-2. Scales the input image to match the video dimensions (with padding if aspect ratios differ)
-3. Creates a video segment from the image with matching properties
-4. If the original video has audio, adds a silent audio track to the intro
-5. Concatenates the intro and original video using FFmpeg's filter_complex
+The tool uses a 3-step process to preserve original audio quality:
+
+1. **Video processing**: Creates intro from image and concatenates with original video using FFmpeg's filter_complex (video is re-encoded)
+2. **Audio processing**: Concatenates a silent intro with the original audio using stream copy (original audio is **not** re-encoded)
+3. **Muxing**: Combines the processed video and audio tracks
+
+This approach ensures that only the silent intro audio is encoded, while your original audio remains bit-perfect.
 
 ## Output Quality
 
-The tool uses the following encoding settings:
-- Video codec: H.264 (libx264)
-- Preset: fast
-- CRF: 18 (high quality)
-- Audio codec: AAC at 192kbps (if audio present)
+- **Video**: H.264 (libx264), CRF 17, slow preset
+- **Audio**: Original audio stream copied without re-encoding (lossless)
+- **Intro silence**: AAC 128kbps (only for the intro duration)
 
 ## License
 
