@@ -7,6 +7,7 @@ import argparse
 import json
 import subprocess
 import sys
+import tempfile
 import os
 from pathlib import Path
 
@@ -39,7 +40,7 @@ def get_audio_info(video_path: str) -> dict | None:
         "ffprobe",
         "-v", "error",
         "-select_streams", "a:0",
-        "-show_entries", "stream=codec_name,sample_rate,channels,bit_rate,channel_layout",
+        "-show_entries", "stream=sample_rate,channels,channel_layout",
         "-of", "json",
         video_path
     ]
@@ -53,17 +54,10 @@ def get_audio_info(video_path: str) -> dict | None:
     channels = int(stream.get("channels", 2))
     channel_layout = stream.get("channel_layout", "stereo" if channels >= 2 else "mono")
 
-    bitrate = stream.get("bit_rate")
-    if bitrate:
-        bitrate = int(bitrate)
-    else:
-        bitrate = 192000  # Default to 192kbps if unknown
-
     return {
         "sample_rate": int(stream.get("sample_rate", 44100)),
         "channels": channels,
         "channel_layout": channel_layout,
-        "bitrate": max(bitrate, 192000),  # Use at least 192kbps
     }
 
 
@@ -73,7 +67,7 @@ def create_video_with_intro(
     duration: float,
     output_path: str
 ) -> None:
-    """Create output video with intro image prepended using filter_complex."""
+    """Create output video with intro using 3-step process to preserve audio quality."""
     video_info = get_video_info(video_path)
     audio_info = get_audio_info(video_path)
 
@@ -81,70 +75,95 @@ def create_video_with_intro(
     fps = video_info["fps_str"]
     pix_fmt = video_info["pix_fmt"]
 
-    # Build filter_complex for video
-    # [0:v] = image input (looped)
-    # [1:v] = video input
-    # [1:a] = audio input (if exists)
-    # [2:a] = silent audio (if video has audio)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        video_only_path = os.path.join(tmpdir, "video.mp4")
 
-    video_filter = (
-        f"[0:v]loop=loop=-1:size=1:start=0,"
-        f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
-        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,"
-        f"setsar=1,fps={fps},format={pix_fmt},"
-        f"trim=duration={duration},setpts=PTS-STARTPTS[intro];"
-        f"[1:v]setpts=PTS-STARTPTS[main];"
-        f"[intro][main]concat=n=2:v=1:a=0[outv]"
-    )
-
-    if audio_info:
-        audio_filter = (
-            f";[2:a]atrim=duration={duration},asetpts=PTS-STARTPTS[introa];"
-            f"[1:a]asetpts=PTS-STARTPTS[maina];"
-            f"[introa][maina]concat=n=2:v=0:a=1[outa]"
+        # Step 1: Create video-only with intro prepended
+        video_filter = (
+            f"[0:v]loop=loop=-1:size=1:start=0,"
+            f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,"
+            f"setsar=1,fps={fps},format={pix_fmt},"
+            f"trim=duration={duration},setpts=PTS-STARTPTS[intro];"
+            f"[1:v]setpts=PTS-STARTPTS[main];"
+            f"[intro][main]concat=n=2:v=1:a=0[outv]"
         )
-        filter_complex = video_filter + audio_filter
-        maps = ["-map", "[outv]", "-map", "[outa]"]
-    else:
-        filter_complex = video_filter
-        maps = ["-map", "[outv]"]
 
-    args = [
-        "ffmpeg", "-y",
-        "-loop", "1",
-        "-i", image_path,
-        "-i", video_path,
-    ]
+        video_args = [
+            "ffmpeg", "-y",
+            "-loop", "1",
+            "-i", image_path,
+            "-i", video_path,
+            "-filter_complex", video_filter,
+            "-map", "[outv]",
+            "-c:v", "libx264",
+            "-preset", "slow",
+            "-crf", "17",
+            "-an",
+            video_only_path
+        ]
 
-    if audio_info:
-        args.extend([
-            "-f", "lavfi",
-            "-i", f"anullsrc=channel_layout={audio_info['channel_layout']}:sample_rate={audio_info['sample_rate']}"
-        ])
+        result = subprocess.run(video_args, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"Error creating video: {result.stderr}", file=sys.stderr)
+            sys.exit(1)
 
-    args.extend([
-        "-filter_complex", filter_complex,
-        *maps,
-        "-c:v", "libx264",
-        "-preset", "slow",
-        "-crf", "17",
-        "-pix_fmt", pix_fmt,
-    ])
+        if audio_info:
+            # Step 2: Create audio with silent intro (preserves original audio via stream copy)
+            silence_path = os.path.join(tmpdir, "silence.m4a")
+            audio_combined_path = os.path.join(tmpdir, "audio.m4a")
+            concat_list_path = os.path.join(tmpdir, "concat.txt")
 
-    if audio_info:
-        # Use high quality audio settings
-        args.extend([
-            "-c:a", "aac",
-            "-b:a", f"{audio_info['bitrate']}",
-            "-ar", str(audio_info['sample_rate']),
-        ])
+            # Create matching silent audio
+            silence_args = [
+                "ffmpeg", "-y",
+                "-f", "lavfi",
+                "-i", f"anullsrc=channel_layout={audio_info['channel_layout']}:sample_rate={audio_info['sample_rate']}",
+                "-t", str(duration),
+                "-c:a", "aac",
+                "-b:a", "128k",
+                silence_path
+            ]
+            result = subprocess.run(silence_args, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"Error creating silence: {result.stderr}", file=sys.stderr)
+                sys.exit(1)
 
-    args.append(output_path)
+            # Concatenate silence + original audio (stream copy preserves quality)
+            with open(concat_list_path, "w") as f:
+                f.write(f"file '{silence_path}'\n")
+                f.write(f"file '{video_path}'\n")
 
-    result = subprocess.run(args, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"Error: {result.stderr}", file=sys.stderr)
-        sys.exit(1)
+            concat_audio_args = [
+                "ffmpeg", "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", concat_list_path,
+                "-map", "0:a",
+                "-c:a", "copy",
+                audio_combined_path
+            ]
+            result = subprocess.run(concat_audio_args, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"Error concatenating audio: {result.stderr}", file=sys.stderr)
+                sys.exit(1)
+
+            # Step 3: Mux video + audio
+            mux_args = [
+                "ffmpeg", "-y",
+                "-i", video_only_path,
+                "-i", audio_combined_path,
+                "-c", "copy",
+                output_path
+            ]
+            result = subprocess.run(mux_args, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"Error muxing: {result.stderr}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            # No audio - just copy video
+            import shutil
+            shutil.copy(video_only_path, output_path)
 
 
 def main():
@@ -206,7 +225,7 @@ Examples:
         sys.exit(1)
 
     print(f"Adding {args.duration}s intro to: {video_path}")
-    print("Encoding (this may take a moment)...")
+    print("Processing...")
     create_video_with_intro(image_path, video_path, args.duration, args.output)
     print(f"Output saved to: {args.output}")
 
